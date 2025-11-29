@@ -1,0 +1,560 @@
+main:
+  params: [input]
+ 
+  steps:
+    - init:
+        assign:
+          - project_id: cs-sh-image-bakery1748
+          # image_id must be the image NAME from display project, e.g. "schwab-rhel8-110278a-20251111-151440"
+          - image_id: ${default(map.get(input, "image_id"), "")}
+          - instance_name: ${default(map.get(input, "instance_name"), "")}
+          - override_scan_result: ${default(map.get(input, "override_scan_result"), "")}
+          - skip_destroy: ${default(map.get(input, "skip_destroy"), false)}
+          - skip_promotion: ${default(map.get(input, "skip_promotion"), false)}
+          - project_number: ${default(map.get(input, "project_number"), sys.get_env("GOOGLE_CLOUD_PROJECT_NUMBER"))}
+          - region: ${default(map.get(input, "region"), "us-central1")}
+          - location_id: ${default(map.get(input, "location_id"), "us-central1")}
+ 
+    # Start at validation (no create_build / creation step)
+    - validation:
+        call: validate_image
+        args:
+          image_id: ${image_id}
+          project_id: ${project_id}
+          location_id: ${location_id}
+          instance_name: ${instance_name}
+          override_scan_result: ${override_scan_result}
+        result: validation_results
+ 
+    # Notify cleanup/promote via Pub/Sub
+    - notify_cleanup_promote_step:
+        call: notify_cleanup_promote
+        args:
+          project_id: ${project_id}
+          image_id: ${image_id}
+          scan_result: ${validation_results.scan_result}
+          validation_instance: ${validation_results.validation_instance}
+          skip_destroy: ${skip_destroy}
+          skip_promotion: ${skip_promotion}
+        result: notification_results
+ 
+    - return_result:
+        return:
+          image_id: ${image_id}
+          scan_result: ${validation_results.scan_result}
+          validation_instance: ${validation_results.validation_instance}
+          notification_result: ${notification_results}
+ 
+ 
+# -------------------------------------------------------------------
+#   NOTIFICATION SUB-WORKFLOW (Pub/Sub trigger for cleanup/promote)
+# -------------------------------------------------------------------
+notify_cleanup_promote:
+  params: [project_id, image_id, scan_result, validation_instance, skip_destroy, skip_promotion]
+ 
+  steps:
+    - publish_message:
+        call: googleapis.pubsub.v1.projects.topics.publish
+        args:
+          # TODO: replace YOUR-CLEANUP-PROMOTE-TOPIC with your real topic name
+          topic: ${"projects/cs-sh-image-bakery1748/topics/schwab-runtime-workflow--promote-topic"}
+          body:
+            messages:
+              - attributes:
+                  image_id: ${image_id}
+                  scan_result: ${scan_result}
+                  validation_instance: ${validation_instance}
+                  skip_destroy: ${string(skip_destroy)}
+                  skip_promotion: ${string(skip_promotion)}
+                  source_workflow: "runtime-validation"
+                data: ${base64.encode(text.encode("trigger-cleanup-promote"))}
+        result: pubsub_result
+ 
+    - return_pubsub:
+        return: ${pubsub_result}
+ 
+ 
+# -------------------------------------------------------------------
+#   VALIDATION PIPELINE
+# -------------------------------------------------------------------
+validate_image:
+  params: [image_id, project_id, location_id, instance_name, override_scan_result]
+ 
+  steps:
+    - skip_instance_creation:
+        switch:
+          - condition: ${instance_name == image_id + "-validation"}
+            next: scan
+ 
+    - create_instance:
+        call: validation_instance
+        args:
+          image_id: ${image_id}
+          project_id: ${project_id}
+          location_id: ${location_id}
+        result: instance_name
+ 
+    - scan:
+        call: qualys_scan
+        args:
+          instance_name: ${instance_name}
+          override_scan_result: ${override_scan_result}
+          project_id: ${project_id}
+          location_id: ${location_id}
+        result: scan_result
+ 
+    - return_multiple_values:
+        return:
+          validation_instance: ${instance_name}
+          scan_result: ${scan_result}
+ 
+
+# -------------------------------------------------------------------
+
+#   VALIDATION INSTANCE CREATION (Cloud Build)
+
+# -------------------------------------------------------------------
+
+validation_instance:
+
+  params: [image_id, project_id, location_id]
+ 
+  steps:
+
+    - the_build:
+
+        call: googleapis.cloudbuild.v1.projects.builds.create
+
+        args:
+
+          projectId: ${project_id}
+
+          # Cloud Build v1 "projects.builds.create" is global
+
+          parent: ${"projects/" + project_id + "/locations/global"}
+
+          body:
+
+            source:
+
+              repoSource:
+
+                repoName: "gcp-ansible-playbooks"
+
+                dir: "pipelines/schwab-rhel8"
+
+                branchName: "master"
+
+            steps:
+
+              - name: "gcr.io/cloud-builders/gcloud"
+
+                entrypoint: "bash"
+
+                args:
+
+                  - -c
+
+                  - |
+
+                    # Create validation VM from display-case image
+
+                    gcloud compute instances create '${_CANDIDATE_IMAGE}-validation' \
+
+                      --image=projects/cs-sh-image-bakery1748/global/images/${_CANDIDATE_IMAGE} \
+
+                      --machine-type=n1-standard-1 \
+
+                      --subnet=imgbake-bakery-usc1 \
+
+                      --no-address \
+
+                      --service-account=sa-kitchen-sh@cs-sh-image-bakery1748.iam.gserviceaccount.com \
+
+                      --zone=us-central1-a \
+
+                      --scopes=cloud-platform \
+
+                      --metadata-from-file startup-script="./validate/validate.sh" | tee build.log
+ 
+                    # Write instance name to Cloud Build output
+
+                    grep validation build.log | cut -d" " -f1 | tr -d '\n' > $$BUILDER_OUTPUT/output
+
+            substitutions:
+
+              _CANDIDATE_IMAGE: ${image_id}
+
+            options:
+
+              dynamic_substitutions: true
+
+            tags:
+
+              - "schwab-rhel8"
+
+              - "validation_instance"
+
+        result: the_buildResults
+ 
+    - decode_build_result:
+
+        assign:
+
+          - instance_name: ${text.decode(base64.decode(the_buildResults.metadata.build.results.buildStepOutputs[0]))}
+ 
+    - check_build_status:
+
+        switch:
+
+          - condition: ${len(instance_name) > 0}
+
+            next: return_the_results
+ 
+    - build_failed:
+
+        raise:
+
+          message: "Validation instance was not created."
+ 
+    - return_the_results:
+
+        return: ${instance_name}
+ 
+ 
+# -------------------------------------------------------------------
+
+#   QUALYS SCAN (Cloud Function)
+
+# -------------------------------------------------------------------
+
+qualys_scan:
+
+  params: [instance_name, override_scan_result, project_id, location_id]
+ 
+  steps:
+
+    - skip_instance_creation:
+
+        switch:
+
+          - condition: ${text.to_lower(override_scan_result) == "pass"}
+
+            next: return_override_pass
+
+          - condition: ${text.to_lower(override_scan_result) == "fail"}
+
+            next: return_override_fail
+ 
+    - get_the_instance_id:
+
+        call: get_instance_id
+
+        args:
+
+          instance_name: ${instance_name}
+
+          project_id: ${project_id}
+
+          location_id: ${location_id}
+
+        result: instance_id
+ 
+    - define:
+
+        assign:
+
+          - i: 0
+ 
+    - qualys_function:
+
+        call: http.post
+
+        args:
+
+          url: https://us-central1-cs-sh-image-bakery1748.cloudfunctions.net/imgbake_qualys_scan_instance_report_function
+
+          body:
+
+            instance_id: ${instance_id}
+
+          auth:
+
+            type: OIDC
+
+            audience: https://us-central1-cs-sh-image-bakery1748.cloudfunctions.net/imgbake_qualys_scan_instance_report_function
+
+        result: qualys_results
+ 
+    - logic:
+
+        switch:
+
+          - condition: ${text.to_lower(qualys_results.body) != "pending"}
+
+            next: return_scan_results
+
+        next: check_iteration
+ 
+    - check_iteration:
+
+        switch:
+
+          - condition: ${i < 24}
+
+            next: wait_step
+
+        next: return_override_fail
+ 
+    - wait_step:
+
+        call: sys.sleep
+
+        args:
+
+          seconds: 3600
+
+        next: iterate
+ 
+    - iterate:
+
+        assign:
+
+          - i: ${i + 1}
+
+        next: qualys_function
+ 
+    - return_scan_results:
+
+        return: ${qualys_results.body}
+ 
+    - return_override_pass:
+
+        return: "Pass"
+ 
+    - return_override_fail:
+
+        return: "Fail"
+ 
+ 
+# -------------------------------------------------------------------
+
+#   CLEANUP PIPELINE (not called from main, but reusable)
+
+# -------------------------------------------------------------------
+
+cleanup_artifacts:
+
+  params: [image_id, project_id, location_id, instance_name, skip_destroy, scan_result]
+ 
+  steps:
+
+    - skip_instance_creation:
+
+        switch:
+
+          - condition: ${skip_destroy}
+
+            next: return_skipped
+ 
+    - delete_instance:
+
+        call: googleapis.cloudbuild.v1.projects.builds.create
+
+        args:
+
+          projectId: ${project_id}
+
+          parent: ${"projects/" + project_id + "/locations/global"}
+
+          body:
+
+            source:
+
+              repoSource:
+
+                repoName: "gcp-ansible-playbooks"
+
+                dir: "pipelines/schwab-rhel8"
+
+                branchName: "master"
+
+            steps:
+
+              - name: "gcr.io/cloud-builders/gcloud"
+
+                entrypoint: "bash"
+
+                args:
+
+                  - -c
+
+                  - |
+
+                    gcloud compute instances stop ${_INSTANCE_NAME} --zone us-central1-a
+
+                    gcloud compute instances delete ${_INSTANCE_NAME} --zone us-central1-a --quiet
+
+            substitutions:
+
+              _INSTANCE_NAME: ${instance_name}
+
+            options:
+
+              dynamic_substitutions: true
+
+            tags:
+
+              - "schwab-rhel8"
+
+              - "delete_instance"
+
+        result: delete_instanceResults
+ 
+    - delete_image:
+
+        call: googleapis.cloudbuild.v1.projects.builds.create
+
+        args:
+
+          projectId: ${project_id}
+
+          parent: ${"projects/" + project_id + "/locations/global"}
+
+          body:
+
+            source:
+
+              repoSource:
+
+                repoName: "gcp-ansible-playbooks"
+
+                dir: "pipelines/schwab-rhel8"
+
+                branchName: "master"
+
+            steps:
+
+              - name: "gcr.io/cloud-builders/gcloud"
+
+                entrypoint: "bash"
+
+                args:
+
+                  - -c
+
+                  - |
+
+                    if [ "${_SCAN_FAIL}" != "Pass" ]; then
+
+                      gcloud logging write FAILED-SCAN-LOG "Validation failed for ${_CANDIDATE_IMAGE}" --severity "WARNING"
+
+                    fi
+ 
+                    gcloud compute images delete ${_CANDIDATE_IMAGE} --quiet
+
+            substitutions:
+
+              _SCAN_FAIL: ${scan_result}
+
+              _CANDIDATE_IMAGE: ${image_id}
+
+            options:
+
+              dynamic_substitutions: true
+
+            tags:
+
+              - "schwab-rhel8"
+
+              - "delete_image"
+
+        result: delete_imageResults
+ 
+    - return_cleanup:
+
+        return:
+
+          instance_cleanup: ${delete_instanceResults}
+
+          image_cleanup: ${delete_imageResults}
+ 
+    - return_skipped:
+
+        return:
+
+          instance_cleanup: "skipped"
+
+          image_cleanup: "skipped"
+
+ 
+# -------------------------------------------------------------------
+
+#   GET INSTANCE ID (for Qualys)
+
+# -------------------------------------------------------------------
+
+get_instance_id:
+
+  params: [instance_name, project_id, location_id]
+ 
+  steps:
+
+    - get_id:
+
+        call: googleapis.cloudbuild.v1.projects.builds.create
+
+        args:
+
+          projectId: ${project_id}
+
+          parent: ${"projects/" + project_id + "/locations/global"}
+
+          body:
+
+            source:
+
+              repoSource:
+
+                repoName: "gcp-ansible-playbooks"
+
+                dir: "pipelines/schwab-rhel8"
+
+                branchName: "master"
+
+            steps:
+
+              - name: "gcr.io/cloud-builders/gcloud"
+
+                entrypoint: "bash"
+
+                args:
+
+                  - -c
+
+                  - |
+
+                    gcloud compute instances describe '${_INSTANCE_NAME}' --zone us-central1-a | tee build.log
+
+                    grep 'id:' build.log | cut -d: -f2 | tr -d '[:space:]',\',\",'\n' > $$BUILDER_OUTPUT/output
+
+            substitutions:
+
+              _INSTANCE_NAME: ${instance_name}
+
+            options:
+
+              dynamic_substitutions: true
+
+            tags:
+
+              - "schwab-rhel8"
+
+              - "get_instance_id"
+
+        result: describe_instanceResults
+ 
+    - return_the_results:
+
+        return: ${text.decode(base64.decode(describe_instanceResults.metadata.build.results.buildStepOutputs[0]))}
+ 

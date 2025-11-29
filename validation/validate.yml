@@ -1,0 +1,399 @@
+---
+# Runtime Validation Playbook
+# Implements per-runtime validation strategy: Install → Validate → Next
+# This playbook can be run after golden image creation to validate all runtimes
+
+- name: Validate Runtime Installations (Per-Runtime Strategy)
+  hosts: targets
+  become: true
+  gather_facts: true
+  
+  vars:
+    validation_dir: "/tmp/runtime_validation"
+    validation_results_dir: "{{ validation_dir }}/results"
+    validation_scripts_dir: "{{ validation_dir }}/scripts"
+    
+  pre_tasks:
+    - name: Validation Setup | Create validation directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - "{{ validation_dir }}"
+        - "{{ validation_results_dir }}"
+        - "{{ validation_scripts_dir }}"
+      
+    - name: Validation Setup | Copy validation scripts to target
+      copy:
+        src: "{{ item }}"
+        dest: "{{ validation_scripts_dir }}/{{ item | basename }}"
+        mode: '0755'
+      loop:
+        - "validate_python.sh"
+        - "validate_java.sh"
+        - "validate_node.sh"
+        - "validate_postgresql.sh"
+      
+    - name: Validation Setup | Display validation strategy
+      debug:
+        msg: |
+          🎯 Validation Strategy: Per-Runtime Validation
+          📋 Strategy: Install Python → Validate Python → Install Java → Validate Java → Install Node.js → Validate Node.js → Install PostgreSQL → Validate PostgreSQL
+          ✅ Benefits: Immediate failure detection, easier root cause analysis
+          ⚠️  Trade-off: Slightly longer playbook execution time
+          
+          Target Host: {{ inventory_hostname }}
+          OS: {{ ansible_distribution }} {{ ansible_distribution_version }}
+          Architecture: {{ ansible_architecture }}
+
+  tasks:
+    # ========================================
+    # PYTHON VALIDATION
+    # ========================================
+    - name: "🐍 Python Runtime Validation"
+      block:
+        - name: Python | Run validation script
+          shell: "{{ validation_scripts_dir }}/validate_python.sh"
+          register: python_validation
+          changed_when: false
+          
+        - name: Python | Display validation results
+          debug:
+            var: python_validation.stdout_lines
+            
+        - name: Python | Save validation results
+          copy:
+            content: |
+              Python Validation Results
+              =========================
+              Exit Code: {{ python_validation.rc }}
+              Timestamp: {{ ansible_date_time.iso8601 }}
+              Host: {{ inventory_hostname }}
+              
+              STDOUT:
+              {{ python_validation.stdout }}
+              
+              STDERR:
+              {{ python_validation.stderr }}
+            dest: "{{ validation_results_dir }}/python_validation.log"
+            
+        - name: Python | Assert validation success
+          assert:
+            that:
+              - python_validation.rc == 0
+            fail_msg: "❌ Python runtime validation FAILED"
+            success_msg: "✅ Python runtime validation PASSED"
+            
+      rescue:
+        - name: Python | Handle validation failure
+          fail:
+            msg: |
+              ❌ PYTHON VALIDATION FAILED ❌
+              
+              Per-runtime validation strategy detected Python runtime failure.
+              This allows immediate identification of the problematic package.
+              
+              Exit Code: {{ python_validation.rc | default('unknown') }}
+              Error Output: {{ python_validation.stderr | default('No error output') }}
+              
+              🔧 Troubleshooting:
+              1. Check if Python3 is installed: python3 --version
+              2. Check if pip3 is installed: pip3 --version
+              3. Verify Python PATH configuration
+              4. Review Python installation logs
+              
+              Stopping validation here to prevent cascading failures.
+              
+      tags: [validation, python]
+
+    # ========================================
+    # JAVA VALIDATION  
+    # ========================================
+    - name: "☕ Java SDK Validation"
+      block:
+        - name: Java | Run validation script
+          shell: "{{ validation_scripts_dir }}/validate_java.sh"
+          register: java_validation
+          changed_when: false
+          
+        - name: Java | Display validation results
+          debug:
+            var: java_validation.stdout_lines
+            
+        - name: Java | Save validation results
+          copy:
+            content: |
+              Java Validation Results
+              =======================
+              Exit Code: {{ java_validation.rc }}
+              Timestamp: {{ ansible_date_time.iso8601 }}
+              Host: {{ inventory_hostname }}
+              
+              STDOUT:
+              {{ java_validation.stdout }}
+              
+              STDERR:
+              {{ java_validation.stderr }}
+            dest: "{{ validation_results_dir }}/java_validation.log"
+            
+        - name: Java | Assert validation success
+          assert:
+            that:
+              - java_validation.rc == 0
+            fail_msg: "❌ Java SDK validation FAILED"
+            success_msg: "✅ Java SDK validation PASSED"
+            
+      rescue:
+        - name: Java | Handle validation failure
+          fail:
+            msg: |
+              ❌ JAVA SDK VALIDATION FAILED ❌
+              
+              Per-runtime validation strategy detected Java SDK failure.
+              This indicates issues with Java installation after Python succeeded.
+              
+              Exit Code: {{ java_validation.rc | default('unknown') }}
+              Error Output: {{ java_validation.stderr | default('No error output') }}
+              
+              🔧 Troubleshooting:
+              1. Check if Java runtime is installed: java -version
+              2. Check if Java compiler is installed: javac -version
+              3. Verify JAVA_HOME environment variable
+              4. Test HelloWorld compilation and execution
+              5. Review Java installation logs
+              
+              Stopping validation here to prevent cascading failures.
+              
+      tags: [validation, java]
+
+    # ========================================
+    # NODE.JS VALIDATION
+    # ========================================
+    - name: "🟢 Node.js Runtime Validation"
+      block:
+        - name: Node.js | Run validation script
+          shell: "{{ validation_scripts_dir }}/validate_node.sh"
+          register: node_validation
+          changed_when: false
+          
+        - name: Node.js | Display validation results
+          debug:
+            var: node_validation.stdout_lines
+            
+        - name: Node.js | Save validation results
+          copy:
+            content: |
+              Node.js Validation Results
+              ==========================
+              Exit Code: {{ node_validation.rc }}
+              Timestamp: {{ ansible_date_time.iso8601 }}
+              Host: {{ inventory_hostname }}
+              
+              STDOUT:
+              {{ node_validation.stdout }}
+              
+              STDERR:
+              {{ node_validation.stderr }}
+            dest: "{{ validation_results_dir }}/node_validation.log"
+            
+        - name: Node.js | Assert validation success
+          assert:
+            that:
+              - node_validation.rc == 0
+            fail_msg: "❌ Node.js runtime validation FAILED"
+            success_msg: "✅ Node.js runtime validation PASSED"
+            
+      rescue:
+        - name: Node.js | Handle validation failure
+          fail:
+            msg: |
+              ❌ NODE.JS VALIDATION FAILED ❌
+              
+              Per-runtime validation strategy detected Node.js runtime failure.
+              Python and Java validation succeeded, so issue is specific to Node.js.
+              
+              Exit Code: {{ node_validation.rc | default('unknown') }}
+              Error Output: {{ node_validation.stderr | default('No error output') }}
+              
+              🔧 Troubleshooting:
+              1. Check if Node.js is installed: node --version
+              2. Check if npm is installed: npm --version
+              3. Verify Node.js repository configuration
+              4. Test simple JavaScript execution
+              5. Review Node.js installation logs
+              
+              Stopping validation here to prevent cascading failures.
+              
+      tags: [validation, node, nodejs]
+
+    # ========================================
+    # POSTGRESQL CLIENT VALIDATION
+    # ========================================
+    - name: "🐘 PostgreSQL Client Validation"
+      block:
+        - name: PostgreSQL | Run validation script
+          shell: "{{ validation_scripts_dir }}/validate_postgresql.sh"
+          register: postgresql_validation
+          changed_when: false
+          
+        - name: PostgreSQL | Display validation results
+          debug:
+            var: postgresql_validation.stdout_lines
+            
+        - name: PostgreSQL | Save validation results
+          copy:
+            content: |
+              PostgreSQL Client Validation Results
+              ====================================
+              Exit Code: {{ postgresql_validation.rc }}
+              Timestamp: {{ ansible_date_time.iso8601 }}
+              Host: {{ inventory_hostname }}
+              
+              STDOUT:
+              {{ postgresql_validation.stdout }}
+              
+              STDERR:
+              {{ postgresql_validation.stderr }}
+            dest: "{{ validation_results_dir }}/postgresql_validation.log"
+            
+        - name: PostgreSQL | Assert validation success
+          assert:
+            that:
+              - postgresql_validation.rc == 0
+            fail_msg: "❌ PostgreSQL client validation FAILED"
+            success_msg: "✅ PostgreSQL client validation PASSED"
+            
+      rescue:
+        - name: PostgreSQL | Handle validation failure
+          fail:
+            msg: |
+              ❌ POSTGRESQL CLIENT VALIDATION FAILED ❌
+              
+              Per-runtime validation strategy detected PostgreSQL client failure.
+              Previous runtimes (Python, Java, Node.js) validation succeeded.
+              
+              Exit Code: {{ postgresql_validation.rc | default('unknown') }}
+              Error Output: {{ postgresql_validation.stderr | default('No error output') }}
+              
+              🔧 Troubleshooting:
+              1. Check if psql is installed: psql --version
+              2. Check if pg_dump is available: pg_dump --version
+              3. Verify PostgreSQL client package installation
+              4. Test SQL parsing functionality
+              5. Review PostgreSQL client installation logs
+              
+              Stopping validation here to prevent cascading failures.
+              
+      tags: [validation, postgresql, database]
+
+  post_tasks:
+    # ========================================
+    # SUMMARY AND CLEANUP
+    # ========================================
+    - name: Validation Summary | Collect all validation results
+      shell: |
+        echo "==============================================="
+        echo "🎉 ALL RUNTIME VALIDATIONS COMPLETED SUCCESSFULLY"
+        echo "==============================================="
+        echo "Validation Strategy: Per-Runtime (Sequential)"
+        echo "Host: {{ inventory_hostname }}"
+        echo "Timestamp: {{ ansible_date_time.iso8601 }}"
+        echo "OS: {{ ansible_distribution }} {{ ansible_distribution_version }}"
+        echo ""
+        echo "✅ Validated Runtimes:"
+        echo "  🐍 Python Runtime: PASSED"
+        echo "  ☕ Java SDK: PASSED" 
+        echo "  🟢 Node.js Runtime: PASSED"
+        echo "  🐘 PostgreSQL Client: PASSED"
+        echo ""
+        echo "📋 Per-Runtime Strategy Benefits Realized:"
+        echo "  • Immediate failure detection enabled"
+        echo "  • Root cause isolation achieved"
+        echo "  • Sequential validation completed successfully"
+        echo ""
+        echo "🚀 Golden image is ready for production use!"
+        echo "==============================================="
+      register: validation_summary
+      changed_when: false
+      
+    - name: Validation Summary | Display final results
+      debug:
+        var: validation_summary.stdout_lines
+        
+    - name: Validation Summary | Save comprehensive results
+      copy:
+        content: |
+          ===============================================
+          RUNTIME VALIDATION SUMMARY REPORT
+          ===============================================
+          
+          Strategy: Per-Runtime Validation (Sequential)
+          Host: {{ inventory_hostname }}
+          Timestamp: {{ ansible_date_time.iso8601 }}
+          OS: {{ ansible_distribution }} {{ ansible_distribution_version }}
+          Architecture: {{ ansible_architecture }}
+          
+          VALIDATION RESULTS:
+          ✅ Python Runtime: PASSED (Exit Code: {{ python_validation.rc }})
+          ✅ Java SDK: PASSED (Exit Code: {{ java_validation.rc }})
+          ✅ Node.js Runtime: PASSED (Exit Code: {{ node_validation.rc }})
+          ✅ PostgreSQL Client: PASSED (Exit Code: {{ postgresql_validation.rc }})
+          
+          STRATEGY ANALYSIS:
+          • Per-runtime validation strategy executed successfully
+          • All runtimes validated individually before proceeding
+          • No cascading failures detected
+          • Root cause isolation capability confirmed
+          • Sequential validation approach provided clear failure points
+          
+          RECOMMENDATIONS:
+          • Golden image validation: COMPLETE ✅
+          • Image ready for production deployment
+          • Consider switching to global validation strategy once stable
+          • Monitor runtime co-existence in production workloads
+          
+          DETAILED LOGS:
+          - Python: {{ validation_results_dir }}/python_validation.log
+          - Java: {{ validation_results_dir }}/java_validation.log
+          - Node.js: {{ validation_results_dir }}/node_validation.log
+          - PostgreSQL: {{ validation_results_dir }}/postgresql_validation.log
+          
+          ===============================================
+        dest: "{{ validation_results_dir }}/validation_summary.log"
+        
+    - name: Validation Cleanup | Fetch validation results to control machine
+      fetch:
+        src: "{{ validation_results_dir }}/{{ item }}"
+        dest: "artifacts/validation/{{ inventory_hostname }}/"
+        flat: yes
+      loop:
+        - python_validation.log
+        - java_validation.log
+        - node_validation.log
+        - postgresql_validation.log
+        - validation_summary.log
+      ignore_errors: true
+      
+    - name: Validation Cleanup | Remove temporary validation directory
+      file:
+        path: "{{ validation_dir }}"
+        state: absent
+      when: cleanup_validation_temp | default(true) | bool
+
+  handlers:
+    - name: validation_failed
+      debug:
+        msg: |
+          💥 VALIDATION FAILED - Per-Runtime Strategy Benefits:
+          
+          ✅ Immediate Detection: Failed runtime identified quickly
+          ✅ Root Cause Isolation: Specific package failure isolated  
+          ✅ No Cascading Effects: Validation stopped at failure point
+          ✅ Clear Debugging Path: Focused troubleshooting possible
+          
+          🔧 Next Steps:
+          1. Review specific runtime validation logs
+          2. Fix identified runtime installation issues
+          3. Re-run validation for failed runtime only
+          4. Continue with remaining runtimes once fixed

@@ -1,0 +1,646 @@
+main:
+
+  params: [input]
+
+ 
+
+  steps:
+
+    - init:
+
+        assign:
+
+          - project_id: sandbox-dev-478813
+
+          # image_id must be the image NAME from display project, e.g. "schwab-rhel8-110278a-20251111-151440"
+
+          - image_id: ${default(map.get(input, "image_id"), "")}
+
+          - instance_name: ${default(map.get(input, "instance_name"), "")}
+
+          - override_scan_result: ${default(map.get(input, "override_scan_result"), "")}
+
+          - skip_destroy: ${default(map.get(input, "skip_destroy"), false)}
+
+          - skip_promotion: ${default(map.get(input, "skip_promotion"), false)}
+
+          - project_number: ${default(map.get(input, "project_number"), sys.get_env("GOOGLE_CLOUD_PROJECT_NUMBER"))}
+
+          - region: ${default(map.get(input, "region"), "us-central1")}
+
+          - location_id: ${default(map.get(input, "location_id"), "us-central1")}
+
+ 
+
+    # Start at validation (no create_build / creation step)
+
+    - validation:
+
+        call: validate_image
+
+        args:
+
+          image_id: ${image_id}
+
+          project_id: ${project_id}
+
+          location_id: ${location_id}
+
+          instance_name: ${instance_name}
+
+          override_scan_result: ${override_scan_result}
+
+        result: validation_results
+
+ 
+
+    # Gate: only notify promote workflow if validation passed
+
+    - decide_notification:
+
+        switch:
+
+          - condition: ${validation_results.scan_result == "Pass"}
+
+            next: notify_cleanup_promote_step
+
+        # If not Pass (i.e., Fail), skip Pub/Sub notification and just return result
+
+        next: return_result
+
+ 
+
+    # Notify cleanup/promote via Pub/Sub (only reached when scan_result == "Pass")
+
+    - notify_cleanup_promote_step:
+
+        call: notify_cleanup_promote
+
+        args:
+
+          project_id: ${project_id}
+
+          image_id: ${image_id}
+
+          scan_result: ${validation_results.scan_result}
+
+          validation_instance: ${validation_results.validation_instance}
+
+          skip_destroy: ${skip_destroy}
+
+          skip_promotion: ${skip_promotion}
+
+        result: notification_results
+
+ 
+
+    - return_result:
+
+        return:
+
+          image_id: ${image_id}
+
+          scan_result: ${validation_results.scan_result}
+
+          validation_instance: ${validation_results.validation_instance}
+
+          # If notification_results is undefined (Fail path), mark as "skipped"
+
+          notification_result: ${default(notification_results, "skipped")}
+
+ 
+
+# -------------------------------------------------------------------
+
+#   NOTIFICATION SUB-WORKFLOW (Pub/Sub trigger for cleanup/promote)
+
+# -------------------------------------------------------------------
+
+ 
+
+notify_cleanup_promote:
+
+  params: [project_id, image_id, scan_result, validation_instance, skip_destroy, skip_promotion]
+
+ 
+
+  steps:
+
+    - publish_message:
+
+        call: googleapis.pubsub.v1.projects.topics.publish
+
+        args:
+
+          topic: ${"projects/sandbox-dev-478813/topics/schwab-runtime-workflow--promote-topic"}
+
+          body:
+
+            messages:
+
+              - attributes:
+
+                  image_id: ${image_id}
+
+                  scan_result: ${scan_result}
+
+                  validation_instance: ${validation_instance}
+
+                  skip_destroy: ${string(skip_destroy)}
+
+                  skip_promotion: ${string(skip_promotion)}
+
+                  source_workflow: "runtime-validation"
+
+                data: ${base64.encode(text.encode("trigger-cleanup-promote"))}
+
+        result: pubsub_result
+
+ 
+
+    - return_pubsub:
+
+        return: ${pubsub_result}
+
+ 
+
+# -------------------------------------------------------------------
+
+#   VALIDATION PIPELINE (driven by validate.sh Pass/Fail)
+
+# -------------------------------------------------------------------
+
+ 
+
+validate_image:
+
+  params: [image_id, project_id, location_id, instance_name, override_scan_result]
+
+ 
+
+  steps:
+
+    # 1) Allow manual override (keeps your previous behavior)
+
+    - check_override:
+
+        switch:
+
+          - condition: ${text.to_lower(override_scan_result) == "pass"}
+
+            next: return_override_pass
+
+          - condition: ${text.to_lower(override_scan_result) == "fail"}
+
+            next: return_override_fail
+
+        next: skip_instance_creation
+
+ 
+
+    # 2) If a validation instance already exists with the expected name, treat it as already validated
+
+    - skip_instance_creation:
+
+        switch:
+
+          - condition: ${instance_name == image_id + "-validation"}
+
+            next: derive_pass_from_existing
+
+        next: create_instance
+
+ 
+
+    # 3) Normal path – create validation VM and run validate.sh (via validation_instance)
+
+    - create_instance:
+
+        call: validation_instance
+
+        args:
+
+          image_id: ${image_id}
+
+          project_id: ${project_id}
+
+          location_id: ${location_id}
+
+        result: validation_output
+
+ 
+
+    - assign_results:
+
+        assign:
+
+          - instance_name: ${validation_output.instance_name}
+
+          - scan_result: ${validation_output.scan_result}
+
+ 
+
+    - return_multiple_values:
+
+        return:
+
+          validation_instance: ${instance_name}
+
+          scan_result: ${scan_result}
+
+ 
+
+    # 4) If caller passed in an already-known validation instance, mark it Pass
+
+    - derive_pass_from_existing:
+
+        return:
+
+          validation_instance: ${instance_name}
+
+          scan_result: "Pass"
+
+ 
+
+    # 5) Override handlers
+
+    - return_override_pass:
+
+        return:
+
+          validation_instance: ${instance_name}
+
+          scan_result: "Pass"
+
+ 
+
+    - return_override_fail:
+
+        return:
+
+          validation_instance: ${instance_name}
+
+          scan_result: "Fail"
+
+ 
+
+# -------------------------------------------------------------------
+
+#   VALIDATION INSTANCE CREATION (Cloud Build)
+
+#   - Creates VM from candidate image
+
+#   - Runs validate.sh (master script)
+
+#   - Uses exit code to decide Pass / Fail
+
+# -------------------------------------------------------------------
+
+ 
+
+validation_instance:
+
+  params: [image_id, project_id, location_id]
+
+ 
+
+  steps:
+
+    - the_build:
+
+        call: googleapis.cloudbuild.v1.projects.builds.create
+
+        args:
+
+          projectId: ${project_id}
+
+          # Cloud Build v1 "projects.builds.create" is global
+
+          parent: ${"projects/" + project_id + "/locations/global"}
+
+          body:
+
+            source:
+
+              repoSource:
+
+                repoName: "gcp-ansible-playbooks"
+
+                dir: "pipelines/schwab-rhel8"
+
+                branchName: "master"
+
+            steps:
+
+              - name: "gcr.io/cloud-builders/gcloud"
+
+                entrypoint: "bash"
+
+                args:
+
+                  - -c
+
+                  - |
+
+                    set -e
+
+ 
+
+                    # Instance name derived from image_id
+
+                    INSTANCE_NAME="${_CANDIDATE_IMAGE}-validation"
+
+ 
+
+                    echo "Creating validation VM: $${INSTANCE_NAME}"
+
+ 
+
+                    # Create validation VM from display-case image
+
+                    gcloud compute instances create "$${INSTANCE_NAME}" \
+
+                      --image=projects/sandbox-dev-478813/global/images/${_CANDIDATE_IMAGE} \
+
+                      --machine-type=n1-standard-1 \
+
+                      --subnet=default \
+
+                      --no-address \
+
+                      --service-account=sa-kitchen-sh@sandbox-dev-478813.iam.gserviceaccount.com \
+
+                      --zone=us-central1-a \
+
+                      --scopes=cloud-platform
+
+ 
+
+                    echo "Running master validation script (validate.sh) against $${INSTANCE_NAME}..."
+
+ 
+
+                    # Master script orchestrates all runtime checks (Python, Node, Java, Postgres, etc.)
+
+                    # It must:
+
+                    #   - exit 0 if ALL runtime checks pass
+
+                    #   - exit non-zero if ANY runtime fails
+
+                    ./validate/validate.sh "$${INSTANCE_NAME}" | tee validation.log
+
+                    VALIDATION_EXIT_CODE=$?
+
+ 
+
+                    if [ $${VALIDATION_EXIT_CODE} -eq 0 ]; then
+
+                      VALIDATION_RESULT="Pass"
+
+                      echo "VALIDATION: PASS"
+
+                    else
+
+                      VALIDATION_RESULT="Fail"
+
+                      echo "VALIDATION: FAIL (exit code: $${VALIDATION_EXIT_CODE})"
+
+                    fi
+
+ 
+
+                    # Emit combined JSON (instance_name + scan_result) to Cloud Build output
+
+                    # Cloud Workflows will parse this.
+
+                    echo "{\"instance_name\":\"$${INSTANCE_NAME}\",\"scan_result\":\"$${VALIDATION_RESULT}\"}" > "$$BUILDER_OUTPUT/output"
+
+ 
+
+            substitutions:
+
+              _CANDIDATE_IMAGE: ${image_id}
+
+            options:
+
+              dynamic_substitutions: true
+
+            tags:
+
+              - "schwab-rhel8"
+
+              - "validation_instance"
+
+        result: the_buildResults
+
+ 
+
+    - decode_build_result:
+
+        assign:
+
+          - validation_info_json: ${text.decode(base64.decode(the_buildResults.metadata.build.results.buildStepOutputs[0]))}
+
+          - validation_info: ${json.decode(validation_info_json)}
+
+          - instance_name: ${validation_info.instance_name}
+
+          - scan_result: ${validation_info.scan_result}
+
+ 
+
+    - check_build_status:
+
+        switch:
+
+          - condition: ${len(instance_name) > 0}
+
+            next: return_the_results
+
+        next: build_failed
+
+ 
+
+    - build_failed:
+
+        raise:
+
+          message: "Validation instance was not created or validation script failed."
+
+ 
+
+    - return_the_results:
+
+        return:
+
+          instance_name: ${instance_name}
+
+          scan_result: ${scan_result}
+
+ 
+
+# -------------------------------------------------------------------
+
+#   CLEANUP PIPELINE (unchanged – still reusable)
+
+# -------------------------------------------------------------------
+
+ 
+
+cleanup_artifacts:
+
+  params: [image_id, project_id, location_id, instance_name, skip_destroy, scan_result]
+
+ 
+
+  steps:
+
+    - skip_instance_creation:
+
+        switch:
+
+          - condition: ${skip_destroy}
+
+            next: return_skipped
+
+ 
+
+    - delete_instance:
+
+        call: googleapis.cloudbuild.v1.projects.builds.create
+
+        args:
+
+          projectId: ${project_id}
+
+          parent: ${"projects/" + project_id + "/locations/global"}
+
+          body:
+
+            source:
+
+              repoSource:
+
+                repoName: "gcp-ansible-playbooks"
+
+                dir: "pipelines/schwab-rhel8"
+
+                branchName: "master"
+
+            steps:
+
+              - name: "gcr.io/cloud-builders/gcloud"
+
+                entrypoint: "bash"
+
+                args:
+
+                  - -c
+
+                  - |
+
+                    gcloud compute instances stop ${_INSTANCE_NAME} --zone us-central1-a
+
+                    gcloud compute instances delete ${_INSTANCE_NAME} --zone us-central1-a --quiet
+
+            substitutions:
+
+              _INSTANCE_NAME: ${instance_name}
+
+            options:
+
+              dynamic_substitutions: true
+
+            tags:
+
+              - "schwab-rhel8"
+
+              - "delete_instance"
+
+        result: delete_instanceResults
+
+ 
+
+    - delete_image:
+
+        call: googleapis.cloudbuild.v1.projects.builds.create
+
+        args:
+
+          projectId: ${project_id}
+
+          parent: ${"projects/" + project_id + "/locations/global"}
+
+          body:
+
+            source:
+
+              repoSource:
+
+                repoName: "gcp-ansible-playbooks"
+
+                dir: "pipelines/schwab-rhel8"
+
+                branchName: "master"
+
+            steps:
+
+              - name: "gcr.io/cloud-builders/gcloud"
+
+                entrypoint: "bash"
+
+                args:
+
+                  - -c
+
+                  - |
+
+                    if [ "${_SCAN_FAIL}" != "Pass" ]; then
+
+                      gcloud logging write FAILED-SCAN-LOG "Validation failed for ${_CANDIDATE_IMAGE}" --severity "WARNING"
+
+                    fi
+
+ 
+
+                    gcloud compute images delete ${_CANDIDATE_IMAGE} --quiet
+
+            substitutions:
+
+              _SCAN_FAIL: ${scan_result}
+
+              _CANDIDATE_IMAGE: ${image_id}
+
+            options:
+
+              dynamic_substitutions: true
+
+            tags:
+
+              - "schwab-rhel8"
+
+              - "delete_image"
+
+        result: delete_imageResults
+
+ 
+
+    - return_cleanup:
+
+        return:
+
+          instance_cleanup: ${delete_instanceResults}
+
+          image_cleanup: ${delete_imageResults}
+
+ 
+
+    - return_skipped:
+
+        return:
+
+          instance_cleanup: "skipped"
+
+          image_cleanup: "skipped"
+
