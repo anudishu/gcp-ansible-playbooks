@@ -210,7 +210,7 @@ validate_image:
 
                     fi
 
-                    # Create VM with OS Login enabled
+                    # Create VM with OS Login enabled (internal IP only, no external IP)
 
                     gcloud compute instances create "$${INSTANCE_NAME}" \
 
@@ -219,6 +219,8 @@ validate_image:
                       --machine-type=${_MACHINE_TYPE} \
 
                       --subnet=default \
+
+                      --no-address \
 
                       --zone=${_ZONE} \
 
