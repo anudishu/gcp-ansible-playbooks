@@ -1,0 +1,12 @@
+runtime: python311
+entry_point: promote_cleanup
+trigger:
+  topic: schwab-runtime-workflow--promote-topic
+  eventType: google.pubsub.topic.publish
+environmentVariables:
+  GCP_PROJECT: sandbox-dev-478813
+timeout: 540s
+availableMemory: 512MB
+serviceAccountEmail: sa-kitchen-sh@sandbox-dev-478813.iam.gserviceaccount.com
+
+

@@ -1,0 +1,946 @@
+main:
+
+  params: [input]
+
+ 
+
+  steps:
+
+    - init:
+
+        assign:
+
+          - project_id: sandbox-dev-478813
+
+          # image_id must be the image NAME from display project, e.g. "test-rhel-vm-image"
+
+          - image_id: ${default(map.get(input, "image_id"), "test-rhel-vm-image")}
+
+          - instance_name: ${default(map.get(input, "instance_name"), "")}
+
+          - override_scan_result: ${default(map.get(input, "override_scan_result"), "")}
+
+          - skip_destroy: ${default(map.get(input, "skip_destroy"), false)}
+
+          - skip_promotion: ${default(map.get(input, "skip_promotion"), false)}
+
+          - region: ${default(map.get(input, "region"), "us-central1")}
+
+          - location_id: ${default(map.get(input, "location_id"), "us-central1")}
+
+          - validation_bucket: "validation-scripts-sandbox-dev-478813"
+
+          - display_project_id: ${default(map.get(input, "display_project_id"), "spoke-project1-476804")}
+
+ 
+
+    # Start at validation
+
+    - validation:
+
+        call: validate_image
+
+        args:
+
+          image_id: ${image_id}
+
+          project_id: ${project_id}
+
+          location_id: ${location_id}
+
+          instance_name: ${instance_name}
+
+          override_scan_result: ${override_scan_result}
+
+          validation_bucket: ${validation_bucket}
+
+        result: validation_results
+
+ 
+
+    # Gate: only promote if validation passed
+
+    - evaluate_results:
+
+        switch:
+
+          - condition: ${validation_results.scan_result != "Pass"}
+
+            next: cleanup
+
+ 
+
+    # Promote image (only if Pass)
+
+    - promotion:
+
+        call: promote_image
+
+        args:
+
+          image_id: ${image_id}
+
+          project_id: ${project_id}
+
+          display_project_id: ${display_project_id}
+
+          location_id: ${location_id}
+
+          validation_instance: ${validation_results.validation_instance}
+
+          skip_promotion: ${skip_promotion}
+
+        result: promotion_result
+
+    # Wait for promotion to fully complete before cleanup
+    # Always wait a bit after promotion step to ensure image is stable
+
+    - wait_after_promotion:
+
+        call: sys.sleep
+
+        args:
+
+          seconds: 10
+
+        next: cleanup
+
+ 
+
+    # Cleanup VM and image
+
+    - cleanup:
+
+        call: cleanup_artifacts
+
+        args:
+
+          image_id: ${image_id}
+
+          project_id: ${project_id}
+
+          location_id: ${location_id}
+
+          instance_name: ${validation_results.validation_instance}
+
+          skip_destroy: ${skip_destroy}
+
+          scan_result: ${validation_results.scan_result}
+
+        result: cleanup_results
+
+ 
+
+    - return_result:
+
+        return:
+
+          image_id: ${image_id}
+
+          scan_result: ${validation_results.scan_result}
+
+          validation_instance: ${validation_results.validation_instance}
+
+          validation_exit_code: ${default(validation_results.validation_exit_code, "N/A")}
+
+          validation_result_file: ${default(validation_results.validation_result_file, "N/A")}
+
+          validation_status_message: "See scan_result field for validation status"
+
+          promotion_result: ${default(promotion_result, "skipped")}
+
+          cleanup_result: ${cleanup_results}
+
+ 
+
+# -------------------------------------------------------------------
+
+#   VALIDATION PIPELINE
+
+# -------------------------------------------------------------------
+
+ 
+
+validate_image:
+
+  params: [image_id, project_id, location_id, instance_name, override_scan_result, validation_bucket]
+
+ 
+
+  steps:
+
+    # 1) Allow manual override
+
+    - check_override:
+
+        switch:
+
+          - condition: ${text.to_lower(override_scan_result) == "pass"}
+
+            next: return_override_pass
+
+          - condition: ${text.to_lower(override_scan_result) == "fail"}
+
+            next: return_override_fail
+
+        next: skip_instance_creation
+
+ 
+
+    # 2) If a validation instance already exists with the expected name, treat it as already validated
+
+    - skip_instance_creation:
+
+        switch:
+
+          - condition: ${instance_name == image_id + "-validation"}
+
+            next: derive_pass_from_existing
+
+        next: create_instance
+
+ 
+
+    # 3) Normal path – create validation VM and run validation scripts
+
+    - create_instance:
+
+        call: validation_instance
+
+        args:
+
+          image_id: ${image_id}
+
+          project_id: ${project_id}
+
+          location_id: ${location_id}
+
+          validation_bucket: ${validation_bucket}
+
+        result: validation_output
+
+ 
+
+    - assign_results:
+
+        assign:
+
+          - instance_name: ${validation_output.instance_name}
+
+          - scan_result: ${validation_output.scan_result}
+
+          - validation_exit_code: ${validation_output.validation_exit_code}
+
+          - validation_result_file: ${validation_output.validation_result_file}
+
+ 
+
+    - return_multiple_values:
+
+        return:
+
+          validation_instance: ${instance_name}
+
+          scan_result: ${scan_result}
+
+          validation_exit_code: ${validation_exit_code}
+
+          validation_result_file: ${validation_result_file}
+
+ 
+
+    # 4) If caller passed in an already-known validation instance, mark it Pass
+
+    - derive_pass_from_existing:
+
+        return:
+
+          validation_instance: ${instance_name}
+
+          scan_result: "Pass"
+
+ 
+
+    # 5) Override handlers
+
+    - return_override_pass:
+
+        return:
+
+          validation_instance: ${instance_name}
+
+          scan_result: "Pass"
+
+ 
+
+    - return_override_fail:
+
+        return:
+
+          validation_instance: ${instance_name}
+
+          scan_result: "Fail"
+
+ 
+
+# -------------------------------------------------------------------
+
+#   VALIDATION INSTANCE CREATION (Cloud Build)
+
+#   - Creates VM from candidate image
+
+#   - Downloads validation scripts from GCS bucket
+
+#   - Runs validate_all.sh (master script)
+
+#   - Uses exit code to decide Pass / Fail
+
+# -------------------------------------------------------------------
+
+ 
+
+validation_instance:
+
+  params: [image_id, project_id, location_id, validation_bucket]
+
+ 
+
+  steps:
+
+    - the_build:
+
+        call: googleapis.cloudbuild.v1.projects.builds.create
+
+        args:
+
+          projectId: ${project_id}
+
+          parent: ${"projects/" + project_id + "/locations/global"}
+
+          body:
+
+            steps:
+
+              - name: "gcr.io/cloud-builders/gcloud"
+
+                entrypoint: "bash"
+
+                args:
+
+                  - -c
+
+                  - |
+
+                    set -e
+
+                    # Instance name derived from image_id
+                    INSTANCE_NAME="${_CANDIDATE_IMAGE}-validation"
+
+                    echo "Creating validation VM: $${INSTANCE_NAME}"
+
+                    # Create validation VM with OS Login enabled and startup script from GCS bucket
+                    # OS Login allows service account-based authentication without SSH keys
+                    # Startup script is fetched from GCS bucket (not inline in workflow)
+                    gcloud compute instances create "$${INSTANCE_NAME}" \
+                      --image=projects/sandbox-dev-478813/global/images/${_CANDIDATE_IMAGE} \
+                      --machine-type=n1-standard-1 \
+                      --subnet=default \
+                      --no-address \
+                      --service-account=sa-kitchen-sh@sandbox-dev-478813.iam.gserviceaccount.com \
+                      --zone=us-central1-a \
+                      --scopes=cloud-platform,https://www.googleapis.com/auth/cloud-platform \
+                      --metadata=enable-oslogin=TRUE,startup-script-url=https://storage.googleapis.com/${_VALIDATION_BUCKET}/validation/startup-validation.sh
+
+                    echo "VM created with startup script. Waiting for validation to complete..."
+
+                    # Wait for VM to boot and validation to run (longer wait needed)
+                    sleep 60
+
+                    # Define result file path early
+                    RESULT_FILE="gs://${_VALIDATION_BUCKET}/validation-results/$${INSTANCE_NAME}-result.json"
+                    
+                    # Poll for validation result by checking metadata or log file
+                    MAX_WAIT=300  # 5 minutes max
+                    WAIT_COUNT=0
+                    VALIDATION_RESULT=""
+                    VALIDATION_EXIT_CODE_FROM_FILE=""
+                    
+                    while [ $${WAIT_COUNT} -lt $${MAX_WAIT} ]; do
+                      # Try to get result from metadata (correct format for metadata items)
+                      METADATA_RESULT=$$(gcloud compute instances describe "$${INSTANCE_NAME}" \
+                        --zone=us-central1-a \
+                        --format="value(metadata.items[key='validation_result'].value)" 2>/dev/null || echo "")
+                      
+                      if [ -n "$${METADATA_RESULT}" ] && [ "$${METADATA_RESULT}" != "null" ]; then
+                        VALIDATION_RESULT="$${METADATA_RESULT}"
+                        echo "Validation result from metadata: $${VALIDATION_RESULT}"
+                        break
+                      fi
+                      
+                      # Also check GCS bucket file (most reliable method)
+                      if gsutil -q stat "$${RESULT_FILE}" 2>/dev/null; then
+                        echo "Found validation result file in GCS, reading..."
+                        GCS_RESULT=$$(gsutil cat "$${RESULT_FILE}" 2>/dev/null || echo "")
+                        
+                        if [ -n "$${GCS_RESULT}" ]; then
+                          # Parse JSON result
+                          VALIDATION_RESULT=$$(echo "$${GCS_RESULT}" | grep -o '"validation_result":"[^"]*"' | cut -d'"' -f4)
+                          VALIDATION_EXIT_CODE_FROM_FILE=$$(echo "$${GCS_RESULT}" | grep -o '"validation_exit_code":[0-9]*' | cut -d':' -f2)
+                          if [ -n "$${VALIDATION_RESULT}" ]; then
+                            echo "Found validation result from GCS: $${VALIDATION_RESULT} (exit code: $${VALIDATION_EXIT_CODE_FROM_FILE})"
+                            break
+                          fi
+                        fi
+                      fi
+                      
+                      # Check if VM is still running startup script (check for completion marker)
+                      echo "Waiting for validation to complete... ($${WAIT_COUNT}s / $${MAX_WAIT}s)"
+                      sleep 10
+                      WAIT_COUNT=$$((WAIT_COUNT + 10))
+                    done
+
+                    # If we still couldn't get result, try reading from startup log via SSH as last resort
+                    if [ -z "$${VALIDATION_RESULT}" ] || [ "$${VALIDATION_RESULT}" = "Unknown" ]; then
+                      echo "Could not get result from metadata or GCS, checking startup log via SSH..."
+                      LOG_RESULT=$$(gcloud compute ssh "$${INSTANCE_NAME}" \
+                        --zone=us-central1-a \
+                        --command="grep -E 'VALIDATION: (PASS|FAIL)' /var/log/validation-startup.log 2>/dev/null | tail -1" \
+                        --quiet 2>/dev/null || echo "")
+                      
+                      if echo "$${LOG_RESULT}" | grep -q "VALIDATION: PASS"; then
+                        VALIDATION_RESULT="Pass"
+                        echo "Found validation result in log: PASS"
+                      elif echo "$${LOG_RESULT}" | grep -q "VALIDATION: FAIL"; then
+                        VALIDATION_RESULT="Fail"
+                        echo "Found validation result in log: FAIL"
+                      else
+                        echo "Could not determine validation result from metadata, GCS, or logs"
+                        VALIDATION_RESULT="Fail"
+                      fi
+                    fi
+
+                    # Determine final result and exit code
+                    if [ "$${VALIDATION_RESULT}" = "Pass" ]; then
+                      VALIDATION_EXIT_CODE=0
+                    else
+                      VALIDATION_EXIT_CODE=1
+                    fi
+
+ 
+
+                    if [ $${VALIDATION_EXIT_CODE} -eq 0 ]; then
+
+                      VALIDATION_RESULT="Pass"
+
+                      echo "VALIDATION: PASS"
+
+                    else
+
+                      VALIDATION_RESULT="Fail"
+
+                      echo "VALIDATION: FAIL (exit code: $${VALIDATION_EXIT_CODE})"
+
+                    fi
+
+ 
+
+                    # Emit combined JSON (instance_name + scan_result + validation details) to Cloud Build output
+
+                    # Cloud Workflows will parse this.
+
+                    # Try to get validation exit code from GCS result file if available
+                    VALIDATION_EXIT_CODE_FROM_FILE=""
+                    if gsutil -q stat "$${RESULT_FILE}" 2>/dev/null; then
+                      GCS_RESULT_FULL=$$(gsutil cat "$${RESULT_FILE}" 2>/dev/null || echo "")
+                      if [ -n "$${GCS_RESULT_FULL}" ]; then
+                        VALIDATION_EXIT_CODE_FROM_FILE=$$(echo "$${GCS_RESULT_FULL}" | grep -o '"validation_exit_code":[0-9]*' | cut -d':' -f2)
+                      fi
+                    fi
+
+                    echo "{\"instance_name\":\"$${INSTANCE_NAME}\",\"scan_result\":\"$${VALIDATION_RESULT}\",\"validation_exit_code\":\"$${VALIDATION_EXIT_CODE_FROM_FILE}\",\"validation_result_file\":\"gs://${_VALIDATION_BUCKET}/validation-results/$${INSTANCE_NAME}-result.json\"}" > "$$BUILDER_OUTPUT/output"
+
+ 
+
+            substitutions:
+
+              _CANDIDATE_IMAGE: ${image_id}
+
+              _VALIDATION_BUCKET: ${validation_bucket}
+
+            options:
+
+              dynamic_substitutions: true
+
+            tags:
+
+              - "schwab-rhel8"
+
+              - "validation_instance"
+
+        result: the_buildResults
+
+ 
+
+    - decode_build_result:
+
+        assign:
+
+          - validation_info_json: ${text.decode(base64.decode(the_buildResults.metadata.build.results.buildStepOutputs[0]))}
+
+          - validation_info: ${json.decode(validation_info_json)}
+
+          - instance_name: ${validation_info.instance_name}
+
+          - scan_result: ${validation_info.scan_result}
+
+          - validation_exit_code: ${default(validation_info.validation_exit_code, "")}
+
+          - validation_result_file: ${default(validation_info.validation_result_file, "")}
+
+ 
+
+    - check_build_status:
+
+        switch:
+
+          - condition: ${len(instance_name) > 0}
+
+            next: return_the_results
+
+        next: build_failed
+
+ 
+
+    - build_failed:
+
+        raise:
+
+          message: "Validation instance was not created or validation script failed."
+
+ 
+
+    - return_the_results:
+
+        return:
+
+          instance_name: ${instance_name}
+
+          scan_result: ${scan_result}
+
+          validation_exit_code: ${validation_exit_code}
+
+          validation_result_file: ${validation_result_file}
+
+ 
+
+# -------------------------------------------------------------------
+
+#   PROMOTE IMAGE (Cloud Build)
+
+#   - Copies validated candidate image to display project
+
+#   - Image is promoted to display project (spoke-project1-476804)
+
+# -------------------------------------------------------------------
+
+ 
+
+promote_image:
+
+  params: [image_id, project_id, display_project_id, location_id, validation_instance, skip_promotion]
+
+ 
+
+  steps:
+
+    - skip_image_promotion:
+
+        switch:
+
+          - condition: ${skip_promotion == true}
+
+            next: return_skipped
+
+ 
+
+    - the_build:
+
+        call: googleapis.cloudbuild.v1.projects.builds.create
+
+        args:
+
+          projectId: ${project_id}
+
+          parent: ${"projects/" + project_id + "/locations/global"}
+
+          body:
+
+            steps:
+
+              - name: "gcr.io/cloud-builders/gcloud"
+
+                entrypoint: "bash"
+
+                args:
+
+                  - -c
+
+                  - |
+
+                    set -e
+
+ 
+
+                    SOURCE_IMAGE="${_IMAGE_ID}"
+
+                    SOURCE_PROJECT="${_SOURCE_PROJECT_ID}"
+
+                    DISPLAY_PROJECT="${_DISPLAY_PROJECT_ID}"
+
+                    PROMOTED_IMAGE_NAME="${_IMAGE_ID}"
+
+ 
+
+                    echo "Promoting validated image $${SOURCE_IMAGE} from project $${SOURCE_PROJECT} to display project $${DISPLAY_PROJECT}..."
+
+                    echo "Source image: projects/$${SOURCE_PROJECT}/global/images/$${SOURCE_IMAGE}"
+
+                    echo "Target project: $${DISPLAY_PROJECT}"
+
+                    echo "Target image name: $${PROMOTED_IMAGE_NAME}"
+
+ 
+
+                    # Copy the validated candidate image to display project
+
+                    echo "Copying image $${SOURCE_IMAGE} to display project $${DISPLAY_PROJECT}..."
+
+                    # Get source image labels to preserve them
+                    echo "Fetching source image labels..."
+                    SOURCE_LABELS_JSON=$$(gcloud compute images describe "$${SOURCE_IMAGE}" \
+                      --project=$${SOURCE_PROJECT} \
+                      --format="json(labels)" 2>/dev/null || echo "{}")
+
+                    # Build labels string - preserve source labels and add promotion labels
+                    # Start with promotion-specific labels
+                    PROMOTED_DATE=$$(date +%Y%m%d)
+                    LABEL_STRING="source_image=$${SOURCE_IMAGE},source_project=$${SOURCE_PROJECT},validation_status=passed,promoted_date=$${PROMOTED_DATE},promoted_by=workflow-new"
+
+                    # Add source labels if they exist
+                    if [ "$${SOURCE_LABELS_JSON}" != "{}" ] && [ -n "$${SOURCE_LABELS_JSON}" ]; then
+                      # Extract labels from JSON and append to label string
+                      SOURCE_LABELS_STR=$$(echo "$${SOURCE_LABELS_JSON}" | grep -o '"[^"]*":"[^"]*"' | sed 's/"\([^"]*\)":"\([^"]*\)"/\1=\2/' | tr '\n' ',' | sed 's/,$//')
+                      if [ -n "$${SOURCE_LABELS_STR}" ]; then
+                        LABEL_STRING="$${LABEL_STRING},$${SOURCE_LABELS_STR}"
+                      fi
+                    fi
+
+                    echo "Creating promoted image with labels: $${LABEL_STRING}"
+
+                    gcloud compute images create "$${PROMOTED_IMAGE_NAME}" \
+
+                      --source-image="projects/$${SOURCE_PROJECT}/global/images/$${SOURCE_IMAGE}" \
+
+                      --project=$${DISPLAY_PROJECT} \
+
+                      --description="Promoted image from validated candidate image ($${SOURCE_IMAGE})" \
+
+                      --family="rhel9-runtime" \
+
+                      --labels=$${LABEL_STRING}
+
+ 
+
+                    echo "Waiting for image copy to display project to complete..."
+
+                    # Wait for image to be ready in display project
+
+                    while true; do
+
+                      IMAGE_STATUS=$$(gcloud compute images describe "$${PROMOTED_IMAGE_NAME}" \
+
+                        --project=$${DISPLAY_PROJECT} \
+
+                        --format="get(status)" 2>/dev/null || echo "NOT_FOUND")
+
+                      if [ "$${IMAGE_STATUS}" == "READY" ]; then
+
+                        break
+
+                      elif [ "$${IMAGE_STATUS}" == "NOT_FOUND" ]; then
+
+                        echo "Waiting for image to appear in display project..."
+
+                      else
+
+                        echo "Image status: $${IMAGE_STATUS}, waiting..."
+
+                      fi
+
+                      sleep 10
+
+                    done
+
+ 
+
+                    echo "Image successfully promoted to display project!"
+
+                    echo "Promoted image: projects/$${DISPLAY_PROJECT}/global/images/$${PROMOTED_IMAGE_NAME}"
+
+                    # Additional wait time to ensure image is fully stable
+                    echo "Waiting additional 10 seconds to ensure image is fully stable..."
+                    sleep 10
+                    echo "Image $${PROMOTED_IMAGE_NAME} is ready for use in display project $${DISPLAY_PROJECT}"
+
+                    echo "{\"promoted_image\":\"$${PROMOTED_IMAGE_NAME}\",\"display_project\":\"$${DISPLAY_PROJECT}\",\"source_image\":\"$${SOURCE_IMAGE}\",\"source_project\":\"$${SOURCE_PROJECT}\"}" > "$$BUILDER_OUTPUT/output"
+
+ 
+
+            substitutions:
+
+              _VALIDATION_INSTANCE: ${validation_instance}
+
+              _IMAGE_ID: ${image_id}
+
+              _SOURCE_PROJECT_ID: ${project_id}
+
+              _DISPLAY_PROJECT_ID: ${display_project_id}
+
+            options:
+
+              dynamic_substitutions: true
+
+            tags:
+
+              - "schwab-rhel8"
+
+              - "promote_image"
+
+        result: the_promoteResults
+
+ 
+
+    - decode_promote_result:
+
+        assign:
+
+          - build_output: ${text.decode(base64.decode(the_promoteResults.metadata.build.results.buildStepOutputs[0]))}
+
+          - parsed_output: ${json.decode(build_output)}
+
+          - promoted_image: ${parsed_output.promoted_image}
+
+          - display_project: ${parsed_output.display_project}
+
+    - return_the_results:
+
+        return: ${"The image " + image_id + " has been promoted to display project " + display_project + " as " + promoted_image}
+
+ 
+
+    - return_skipped:
+
+        return: ${"The promotion of image " + image_id + " has been skipped."}
+
+ 
+
+# -------------------------------------------------------------------
+
+#   CLEANUP PIPELINE (Cloud Build)
+
+#   - Deletes validation VM
+
+#   - Deletes candidate image (if validation failed)
+
+# -------------------------------------------------------------------
+
+ 
+
+cleanup_artifacts:
+
+  params: [image_id, project_id, location_id, instance_name, skip_destroy, scan_result]
+
+ 
+
+  steps:
+
+    - skip_instance_creation:
+
+        switch:
+
+          - condition: ${skip_destroy}
+
+            next: return_skipped
+
+ 
+
+    - delete_instance:
+
+        call: googleapis.cloudbuild.v1.projects.builds.create
+
+        args:
+
+          projectId: ${project_id}
+
+          parent: ${"projects/" + project_id + "/locations/global"}
+
+          body:
+
+            steps:
+
+              - name: "gcr.io/cloud-builders/gcloud"
+
+                entrypoint: "bash"
+
+                args:
+
+                  - -c
+
+                  - |
+
+                    set -e
+
+ 
+
+                    INSTANCE_NAME="${_INSTANCE_NAME}"
+
+                    echo "Stopping VM $${INSTANCE_NAME}..."
+
+                    gcloud compute instances stop "$${INSTANCE_NAME}" \
+                      --zone=us-central1-a \
+                      --quiet || echo "VM may already be stopped"
+
+ 
+
+                    echo "Waiting for VM to be fully stopped (allowing time for image promotion to complete)..."
+
+                    sleep 20
+
+ 
+
+                    echo "Deleting VM $${INSTANCE_NAME}..."
+
+                    gcloud compute instances delete "$${INSTANCE_NAME}" \
+                      --zone=us-central1-a \
+                      --quiet
+
+ 
+
+                    echo "VM $${INSTANCE_NAME} deleted successfully"
+
+                    echo "{\"instance_deleted\":\"$${INSTANCE_NAME}\"}" > "$$BUILDER_OUTPUT/output"
+
+ 
+
+            substitutions:
+
+              _INSTANCE_NAME: ${instance_name}
+
+            options:
+
+              dynamic_substitutions: true
+
+            tags:
+
+              - "schwab-rhel8"
+
+              - "delete_instance"
+
+        result: delete_instanceResults
+
+ 
+
+    - delete_image:
+
+        call: googleapis.cloudbuild.v1.projects.builds.create
+
+        args:
+
+          projectId: ${project_id}
+
+          parent: ${"projects/" + project_id + "/locations/global"}
+
+          body:
+
+            steps:
+
+              - name: "gcr.io/cloud-builders/gcloud"
+
+                entrypoint: "bash"
+
+                args:
+
+                  - -c
+
+                  - |
+
+                    set -e
+
+
+
+                    # Log validation result but DO NOT delete candidate image
+                    # Candidate image is always preserved (for testing and future use)
+                    if [ "${_SCAN_FAIL}" != "Pass" ]; then
+
+                      echo "Validation failed for ${_CANDIDATE_IMAGE}, logging failure..."
+
+                      gcloud logging write FAILED-SCAN-LOG "Validation failed for ${_CANDIDATE_IMAGE}" --severity "WARNING"
+
+                      echo "Validation failed - image will NOT be promoted to display project"
+
+                      echo "Keeping candidate image ${_CANDIDATE_IMAGE} (not deleting during testing)"
+
+                    else
+
+                      echo "Validation passed for ${_CANDIDATE_IMAGE}"
+
+                      echo "Image has been promoted to display project"
+
+                      echo "Keeping candidate image ${_CANDIDATE_IMAGE} (not deleting during testing)"
+
+                    fi
+
+                    echo "Note: Candidate image is preserved and will not be deleted."
+
+                    echo "{\"image_cleanup\":\"completed\",\"candidate_image_preserved\":\"${_CANDIDATE_IMAGE}\",\"validation_result\":\"${_SCAN_FAIL}\"}" > "$$BUILDER_OUTPUT/output"
+
+ 
+
+            substitutions:
+
+              _SCAN_FAIL: ${scan_result}
+
+              _CANDIDATE_IMAGE: ${image_id}
+
+            options:
+
+              dynamic_substitutions: true
+
+            tags:
+
+              - "schwab-rhel8"
+
+              - "delete_image"
+
+        result: delete_imageResults
+
+ 
+
+    - return_cleanup:
+
+        return:
+
+          instance_cleanup: ${delete_instanceResults}
+
+          image_cleanup: ${delete_imageResults}
+
+ 
+
+    - return_skipped:
+
+        return:
+
+          instance_cleanup: "skipped"
+
+          image_cleanup: "skipped"
+

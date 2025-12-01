@@ -71,6 +71,7 @@ main:
  
 
     # Notify cleanup/promote via Pub/Sub (only reached when scan_result == "Pass")
+    # Cloud Function will handle image promotion and cleanup
 
     - notify_cleanup_promote_step:
 
@@ -92,6 +93,42 @@ main:
 
         result: notification_results
 
+        next: wait_for_cleanup_completion
+
+ 
+
+    # Wait for Cloud Function to complete VM cleanup
+
+    - wait_for_cleanup_completion:
+
+        switch:
+
+          - condition: ${skip_destroy == true}
+
+            next: return_result
+
+        next: poll_vm_deletion
+
+ 
+
+    - poll_vm_deletion:
+
+        call: check_vm_deleted
+
+        args:
+
+          project_id: ${project_id}
+
+          instance_name: ${validation_results.validation_instance}
+
+          max_attempts: 30
+
+          wait_seconds: 10
+
+        result: vm_deletion_status
+
+        next: return_result
+
  
 
     - return_result:
@@ -107,6 +144,16 @@ main:
           # If notification_results is undefined (Fail path), mark as "skipped"
 
           notification_result: ${default(notification_results, "skipped")}
+
+          # Note: Image promotion and cleanup are handled by Cloud Function
+
+          # Cloud Function subscribes to Pub/Sub topic and processes:
+
+          # 1. Create promoted image from validation VM
+
+          # 2. Cleanup validation VM
+
+          vm_deletion_status: ${default(vm_deletion_status, "skipped")}
 
  
 
@@ -180,7 +227,7 @@ validate_image:
 
   steps:
 
-    # 1) Allow manual override (keeps your previous behavior)
+    # 1) Check override - if pass, create VM but skip validation scripts
 
     - check_override:
 
@@ -188,7 +235,7 @@ validate_image:
 
           - condition: ${text.to_lower(override_scan_result) == "pass"}
 
-            next: return_override_pass
+            next: create_vm_override_pass
 
           - condition: ${text.to_lower(override_scan_result) == "fail"}
 
@@ -238,6 +285,8 @@ validate_image:
 
           - scan_result: ${validation_output.scan_result}
 
+        next: return_multiple_values
+
  
 
     - return_multiple_values:
@@ -264,13 +313,33 @@ validate_image:
 
     # 5) Override handlers
 
+    # Create VM when override = "pass" but skip validation scripts
+
+    - create_vm_override_pass:
+
+        call: create_vm_only
+
+        args:
+
+          image_id: ${image_id}
+
+          project_id: ${project_id}
+
+          location_id: ${location_id}
+
+        result: vm_result
+
+        next: return_override_pass
+
     - return_override_pass:
 
-        return:
+        assign:
 
-          validation_instance: ${instance_name}
+          - instance_name: ${vm_result.instance_name}
 
-          scan_result: "Pass"
+          - scan_result: "Pass"
+
+        next: return_multiple_values
 
  
 
@@ -326,7 +395,7 @@ validation_instance:
 
                 repoName: "gcp-ansible-playbooks"
 
-                dir: "pipelines/schwab-rhel8"
+                dir: "."
 
                 branchName: "master"
 
@@ -376,7 +445,15 @@ validation_instance:
 
  
 
-                    echo "Running master validation script (validate.sh) against $${INSTANCE_NAME}..."
+                    echo "Waiting for VM to be ready..."
+                    sleep 30
+
+                    echo "Copying validation scripts to VM..."
+                    gcloud compute scp --recurse ./validation/ "$${INSTANCE_NAME}:~/validation" \
+                      --zone=us-central1-a \
+                      --quiet
+
+                    echo "Running master validation script (validate_all.sh) on VM $${INSTANCE_NAME}..."
 
  
 
@@ -388,7 +465,10 @@ validation_instance:
 
                     #   - exit non-zero if ANY runtime fails
 
-                    ./validate/validate.sh "$${INSTANCE_NAME}" | tee validation.log
+                    gcloud compute ssh "$${INSTANCE_NAME}" \
+                      --zone=us-central1-a \
+                      --command="cd ~/validation && chmod +x *.sh && bash validate_all.sh" \
+                      --quiet > validation.log 2>&1
 
                     VALIDATION_EXIT_CODE=$?
 
@@ -482,6 +562,266 @@ validation_instance:
 
 # -------------------------------------------------------------------
 
+#   CREATE VM ONLY (for override pass scenario - creates VM but skips validation)
+
+# -------------------------------------------------------------------
+
+ 
+
+create_vm_only:
+
+  params: [image_id, project_id, location_id]
+
+ 
+
+  steps:
+
+    - the_build:
+
+        call: googleapis.cloudbuild.v1.projects.builds.create
+
+        args:
+
+          projectId: ${project_id}
+
+          parent: ${"projects/" + project_id + "/locations/global"}
+
+          body:
+
+            steps:
+
+              - name: "gcr.io/cloud-builders/gcloud"
+
+                entrypoint: "bash"
+
+                args:
+
+                  - -c
+
+                  - |
+
+                    set -e
+
+ 
+
+                    # Instance name derived from image_id
+
+                    INSTANCE_NAME="${_CANDIDATE_IMAGE}-validation"
+
+ 
+
+                    echo "Creating validation VM (override pass - skipping validation scripts): $${INSTANCE_NAME}"
+
+ 
+
+                    # Create validation VM from image
+                    # Note: Validation scripts are NOT executed (override pass scenario)
+
+                    gcloud compute instances create "$${INSTANCE_NAME}" \
+                      --image=projects/sandbox-dev-478813/global/images/${_CANDIDATE_IMAGE} \
+                      --machine-type=n1-standard-1 \
+                      --subnet=default \
+                      --no-address \
+                      --service-account=sa-kitchen-sh@sandbox-dev-478813.iam.gserviceaccount.com \
+                      --zone=us-central1-a \
+                      --scopes=cloud-platform
+
+ 
+
+                    echo "VM created successfully. Validation scripts skipped (override pass)."
+
+ 
+
+                    # Emit instance name to Cloud Build output
+
+                    echo "{\"instance_name\":\"$${INSTANCE_NAME}\",\"scan_result\":\"Pass\"}" > "$$BUILDER_OUTPUT/output"
+
+ 
+
+            substitutions:
+
+              _CANDIDATE_IMAGE: ${image_id}
+
+            options:
+
+              dynamic_substitutions: true
+
+            tags:
+
+              - "schwab-rhel8"
+
+              - "validation_instance"
+
+              - "override_pass"
+
+        result: the_buildResults
+
+ 
+
+    - decode_build_result:
+
+        assign:
+
+          - build_output: ${text.decode(base64.decode(the_buildResults.metadata.build.results.buildStepOutputs[0]))}
+
+          - parsed_output: ${text.decode(base64.decode(the_buildResults.metadata.build.results.buildStepOutputs[0]))}
+
+          - instance_name: ${default(json.decode(parsed_output).instance_name, "")}
+
+          - scan_result: ${default(json.decode(parsed_output).scan_result, "Pass")}
+
+ 
+
+    - return_result:
+
+        return:
+
+          instance_name: ${instance_name}
+
+          scan_result: ${scan_result}
+
+ 
+
+#   CREATE PROMOTED IMAGE (from temp VM)
+
+# -------------------------------------------------------------------
+
+ 
+
+create_promoted_image:
+
+  params: [project_id, image_id, validation_instance]
+
+ 
+
+  steps:
+
+    - the_build:
+
+        call: googleapis.cloudbuild.v1.projects.builds.create
+
+        args:
+
+          projectId: ${project_id}
+
+          parent: ${"projects/" + project_id + "/locations/global"}
+
+          body:
+
+            steps:
+
+              - name: "gcr.io/cloud-builders/gcloud"
+
+                entrypoint: "bash"
+
+                args:
+
+                  - -c
+
+                  - |
+
+                    set -e
+
+ 
+
+                    INSTANCE_NAME="${_VALIDATION_INSTANCE}"
+
+                    PROMOTED_IMAGE_NAME="${_IMAGE_ID}-promoted-$(date +%Y%m%d-%H%M%S)"
+
+ 
+
+                    echo "Stopping VM $${INSTANCE_NAME} before creating image..."
+
+                    gcloud compute instances stop "$${INSTANCE_NAME}" \
+
+                      --zone=us-central1-a \
+
+                      --quiet
+
+
+
+                    echo "Getting disk name from VM $${INSTANCE_NAME}..."
+
+                    DISK_PATH=$(gcloud compute instances describe "$${INSTANCE_NAME}" \
+
+                      --zone=us-central1-a \
+
+                      --format="get(disks[0].source)")
+
+                    DISK_NAME=$(basename "$${DISK_PATH}")
+
+                    if [ -z "$${DISK_NAME}" ]; then
+
+                      DISK_NAME="$${INSTANCE_NAME}"
+
+                    fi
+
+
+
+                    echo "Creating promoted image $${PROMOTED_IMAGE_NAME} from disk $${DISK_NAME}..."
+
+                    gcloud compute images create "$${PROMOTED_IMAGE_NAME}" \
+
+                      --source-disk="$${DISK_NAME}" \
+
+                      --source-disk-zone=us-central1-a \
+
+                      --project=${project_id} \
+
+                      --description="Promoted image from validated VM" \
+
+                      --family="rhel9-runtime" \
+
+                      --labels=source_image="${_IMAGE_ID}",validation_status="passed"
+
+ 
+
+                    echo "Promoted image created: $${PROMOTED_IMAGE_NAME}"
+
+                    echo "{\"promoted_image\":\"$${PROMOTED_IMAGE_NAME}\"}" > "$$BUILDER_OUTPUT/output"
+
+ 
+
+            substitutions:
+
+              _VALIDATION_INSTANCE: ${validation_instance}
+
+              _IMAGE_ID: ${image_id}
+
+            options:
+
+              dynamic_substitutions: true
+
+            tags:
+
+              - "schwab-rhel8"
+
+              - "promote_image"
+
+        result: the_buildResults
+
+ 
+
+    - decode_build_result:
+
+        assign:
+
+          - build_output: ${text.decode(base64.decode(the_buildResults.metadata.build.results.buildStepOutputs[0]))}
+
+          - parsed_output: ${json.decode(build_output)}
+
+          - promoted_image: ${parsed_output.promoted_image}
+
+ 
+
+    - return_result:
+
+        return:
+
+          promoted_image: ${promoted_image}
+
+ 
+
 #   CLEANUP PIPELINE (unchanged – still reusable)
 
 # -------------------------------------------------------------------
@@ -517,16 +857,6 @@ cleanup_artifacts:
           parent: ${"projects/" + project_id + "/locations/global"}
 
           body:
-
-            source:
-
-              repoSource:
-
-                repoName: "gcp-ansible-playbooks"
-
-                dir: "pipelines/schwab-rhel8"
-
-                branchName: "master"
 
             steps:
 
@@ -573,16 +903,6 @@ cleanup_artifacts:
           parent: ${"projects/" + project_id + "/locations/global"}
 
           body:
-
-            source:
-
-              repoSource:
-
-                repoName: "gcp-ansible-playbooks"
-
-                dir: "pipelines/schwab-rhel8"
-
-                branchName: "master"
 
             steps:
 
@@ -643,4 +963,146 @@ cleanup_artifacts:
           instance_cleanup: "skipped"
 
           image_cleanup: "skipped"
+
+ 
+
+# -------------------------------------------------------------------
+
+#   CHECK VM DELETION STATUS (Poll until VM is deleted or timeout)
+
+# -------------------------------------------------------------------
+
+ 
+
+check_vm_deleted:
+
+  params: [project_id, instance_name, max_attempts, wait_seconds]
+
+ 
+
+  steps:
+
+    - init_polling:
+
+        assign:
+
+          - attempt: 1
+
+          - vm_deleted: false
+
+ 
+
+    - poll_loop:
+
+        try:
+
+          call: googleapis.compute.v1.instances.get
+
+          args:
+
+            project: ${project_id}
+
+            zone: "us-central1-a"
+
+            instance: ${instance_name}
+
+          result: vm_instance
+
+        except:
+
+          as: e
+
+          assign:
+
+            - vm_deleted: true
+
+        next: check_if_deleted
+
+ 
+
+    - check_if_deleted:
+
+        switch:
+
+          - condition: ${vm_deleted == true}
+
+            next: return_deleted
+
+        next: check_status
+
+ 
+
+    - check_status:
+
+        switch:
+
+          - condition: ${vm_instance.status == "TERMINATED"}
+
+            assign:
+
+              - vm_deleted: true
+
+            next: return_deleted
+
+        next: increment_and_retry
+
+ 
+
+    - increment_and_retry:
+
+        assign:
+
+          - attempt: ${attempt + 1}
+
+        next: check_max_attempts
+
+ 
+
+    - check_max_attempts:
+
+        switch:
+
+          - condition: ${attempt >= max_attempts}
+
+            next: return_timeout
+
+        next: wait_before_retry
+
+ 
+
+    - wait_before_retry:
+
+        call: sys.sleep
+
+        args:
+
+          seconds: ${wait_seconds}
+
+        next: poll_loop
+
+ 
+
+    - return_deleted:
+
+        return:
+
+          vm_deleted: true
+
+          status: "deleted"
+
+          attempts: ${attempt}
+
+ 
+
+    - return_timeout:
+
+        return:
+
+          vm_deleted: false
+
+          status: "timeout"
+
+          attempts: ${attempt}
+
+          message: "VM deletion not completed within timeout period"
 
