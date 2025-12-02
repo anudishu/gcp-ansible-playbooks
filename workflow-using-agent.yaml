@@ -1,0 +1,806 @@
+main:
+
+  params: [input]
+
+ 
+
+  steps:
+
+    - init:
+
+        assign:
+
+          # Source project where candidate image exists
+
+          - project_id: ${default(map.get(input, "project_id"), "sandbox-dev-478813")}
+
+          # Image to validate (must exist in source project) - using agent image
+
+          - image_id: ${default(map.get(input, "image_id"), "test-rhel-vm-agent-image")}
+
+          # Display project where validated image will be promoted
+
+          - display_project_id: ${default(map.get(input, "display_project_id"), "spoke-project1-476804")}
+
+          # Git repository details
+
+          - repo_name: ${default(map.get(input, "repo_name"), "gcp-ansible-playbooks")}
+
+          - repo_branch: ${default(map.get(input, "repo_branch"), "master")}
+
+          - repo_dir: ${default(map.get(input, "repo_dir"), "validation")}
+
+          # Service account for VM (optional, uses default if not provided)
+
+          - service_account: ${default(map.get(input, "service_account"), "")}
+
+          # Zone for VM creation
+
+          - zone: ${default(map.get(input, "zone"), "us-central1-a")}
+
+          # Machine type for validation VM
+
+          - machine_type: ${default(map.get(input, "machine_type"), "n1-standard-1")}
+
+ 
+
+    # Step 1: Create VM and run validation from Git repo
+
+    - validation:
+
+        call: validate_image
+
+        args:
+
+          image_id: ${image_id}
+
+          project_id: ${project_id}
+
+          display_project_id: ${display_project_id}
+
+          repo_name: ${repo_name}
+
+          repo_branch: ${repo_branch}
+
+          repo_dir: ${repo_dir}
+
+          service_account: ${service_account}
+
+          zone: ${zone}
+
+          machine_type: ${machine_type}
+
+        result: validation_results
+
+ 
+
+    # Step 2: Check if validation passed
+
+    - check_result:
+
+        switch:
+
+          - condition: ${validation_results.scan_result != "Pass"}
+
+            next: cleanup
+
+ 
+
+    # Step 3: Remove Qualys agent and create new image (only if Pass)
+
+    - remove_agent_and_create_image:
+
+        call: remove_agent_create_image
+
+        args:
+
+          instance_name: ${validation_results.validation_instance}
+
+          project_id: ${project_id}
+
+          zone: ${zone}
+
+          source_image_id: ${image_id}
+
+        result: new_image_result
+
+ 
+
+    # Step 4: Promote new image to display project (only if Pass)
+
+    - promotion:
+
+        call: promote_image
+
+        args:
+
+          image_id: ${new_image_result.new_image_id}
+
+          project_id: ${project_id}
+
+          display_project_id: ${display_project_id}
+
+        result: promotion_result
+
+        next: cleanup
+
+ 
+
+    # Step 5: Cleanup VM
+
+    - cleanup:
+
+        call: cleanup_vm
+
+        args:
+
+          instance_name: ${validation_results.validation_instance}
+
+          project_id: ${project_id}
+
+          zone: ${zone}
+
+        result: cleanup_result
+
+ 
+
+    # Step 6: Return final result
+
+    - return_result:
+
+        return:
+
+          source_image_id: ${image_id}
+
+          new_image_id: ${default(new_image_result.new_image_id, "not_created")}
+
+          validation_result: ${validation_results.scan_result}
+
+          validation_instance: ${validation_results.validation_instance}
+
+          promotion_result: ${default(promotion_result, "skipped")}
+
+          cleanup_result: ${cleanup_result}
+
+ 
+
+# -------------------------------------------------------------------
+
+#   VALIDATION: Create VM, clone repo, run validation scripts
+
+# -------------------------------------------------------------------
+
+ 
+
+validate_image:
+
+  params: [image_id, project_id, display_project_id, repo_name, repo_branch, repo_dir, service_account, zone, machine_type]
+
+ 
+
+  steps:
+
+    - create_and_validate:
+
+        call: googleapis.cloudbuild.v1.projects.builds.create
+
+        args:
+
+          projectId: ${project_id}
+
+          parent: ${"projects/" + project_id + "/locations/global"}
+
+          body:
+
+            # Clone repository using repoSource
+
+            source:
+
+              repoSource:
+
+                repoName: ${repo_name}
+
+                branchName: ${repo_branch}
+
+                dir: ${repo_dir}
+
+            steps:
+
+              - name: "gcr.io/cloud-builders/gcloud"
+
+                entrypoint: "bash"
+
+                args:
+
+                  - -c
+
+                  - |
+
+                    set -e
+
+                    INSTANCE_NAME="${_IMAGE_ID}-validation"
+
+                    echo "Step 1: Creating validation VM: $${INSTANCE_NAME}"
+
+                    # Build service account command (use default if not provided)
+
+                    SA_CMD=""
+
+                    if [ -n "${_SERVICE_ACCOUNT}" ]; then
+
+                      SA_CMD="--service-account=${_SERVICE_ACCOUNT}"
+
+                    fi
+
+                    # Create VM with OS Login enabled (internal IP only, no external IP)
+
+                    gcloud compute instances create "$${INSTANCE_NAME}" \
+
+                      --image=projects/${_PROJECT_ID}/global/images/${_IMAGE_ID} \
+
+                      --machine-type=${_MACHINE_TYPE} \
+
+                      --subnet=default \
+
+                      --no-address \
+
+                      --zone=${_ZONE} \
+
+                      --project=${_PROJECT_ID} \
+
+                      --scopes=cloud-platform,https://www.googleapis.com/auth/cloud-platform \
+
+                      --metadata=enable-oslogin=TRUE \
+
+                      $${SA_CMD}
+
+                    echo "VM created. Waiting for VM to be ready..."
+
+                    sleep 60
+
+                    echo "Step 2: Copying validation scripts from cloned repo to VM..."
+
+                    # Copy validation scripts from Cloud Build workspace to VM
+
+                    # Cloud Build has cloned the repo, scripts are in current directory (repo_dir)
+
+                    gcloud compute scp --recurse . "$${INSTANCE_NAME}:~/validation" \
+
+                      --zone=${_ZONE} \
+
+                      --project=${_PROJECT_ID} \
+
+                      --quiet 2>&1 || {
+
+                      echo "SCP failed, trying SSH with direct copy..."
+
+                      # Alternative: Use SSH to copy files
+
+                      gcloud compute ssh "$${INSTANCE_NAME}" \
+
+                        --zone=${_ZONE} \
+
+                        --project=${_PROJECT_ID} \
+
+                        --command="mkdir -p ~/validation" 2>&1
+
+                      # Copy files one by one if needed
+
+                      for file in *.sh; do
+
+                        if [ -f "$${file}" ]; then
+
+                          gcloud compute scp "$${file}" "$${INSTANCE_NAME}:~/validation/" \
+
+                            --zone=${_ZONE} \
+
+                            --project=${_PROJECT_ID} \
+
+                            --quiet 2>&1 || echo "Warning: Could not copy $${file}"
+
+                        fi
+
+                      done
+
+                    }
+
+                    echo "Step 3: Making scripts executable on VM..."
+
+                    gcloud compute ssh "$${INSTANCE_NAME}" \
+
+                      --zone=${_ZONE} \
+
+                      --project=${_PROJECT_ID} \
+
+                      --command="chmod +x ~/validation/*.sh" 2>&1
+
+                    echo "Step 4: Running validation script on VM..."
+
+                    # Run master validation script (validate_all.sh)
+
+                    gcloud compute ssh "$${INSTANCE_NAME}" \
+
+                      --zone=${_ZONE} \
+
+                      --project=${_PROJECT_ID} \
+
+                      --command="cd ~/validation && bash validate_all.sh" 2>&1
+
+                    VALIDATION_EXIT_CODE=$?
+
+                    echo "Validation script exit code: $${VALIDATION_EXIT_CODE}"
+
+                    # Determine validation result
+
+                    if [ $${VALIDATION_EXIT_CODE} -eq 0 ]; then
+
+                      VALIDATION_RESULT="Pass"
+
+                      echo "VALIDATION: PASS"
+
+                    else
+
+                      VALIDATION_RESULT="Fail"
+
+                      echo "VALIDATION: FAIL (exit code: $${VALIDATION_EXIT_CODE})"
+
+                    fi
+
+                    echo "Step 5: Validation completed"
+
+                    echo "Final validation result: $${VALIDATION_RESULT}"
+
+                    # Output result to Cloud Build (workflow will read this)
+
+                    echo "{\"instance_name\":\"$${INSTANCE_NAME}\",\"scan_result\":\"$${VALIDATION_RESULT}\",\"validation_exit_code\":$${VALIDATION_EXIT_CODE},\"timestamp\":\"$$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}" > "$$BUILDER_OUTPUT/output"
+
+            substitutions:
+
+              _IMAGE_ID: ${image_id}
+
+              _PROJECT_ID: ${project_id}
+
+              _DISPLAY_PROJECT_ID: ${display_project_id}
+
+              _SERVICE_ACCOUNT: ${service_account}
+
+              _ZONE: ${zone}
+
+              _MACHINE_TYPE: ${machine_type}
+
+            options:
+
+              dynamic_substitutions: true
+
+            tags:
+
+              - "validation"
+
+              - "agent-based"
+
+        result: build_result
+
+ 
+
+    - decode_result:
+
+        assign:
+
+          - result_json: ${text.decode(base64.decode(build_result.metadata.build.results.buildStepOutputs[0]))}
+
+          - result: ${json.decode(result_json)}
+
+          - instance_name: ${result.instance_name}
+
+          - scan_result: ${result.scan_result}
+
+ 
+
+    - return_validation_result:
+
+        return:
+
+          validation_instance: ${instance_name}
+
+          scan_result: ${scan_result}
+
+ 
+
+# -------------------------------------------------------------------
+
+#   REMOVE AGENT AND CREATE IMAGE: Remove Qualys agent, create new image
+
+# -------------------------------------------------------------------
+
+ 
+
+remove_agent_create_image:
+
+  params: [instance_name, project_id, zone, source_image_id]
+
+ 
+
+  steps:
+
+    - remove_agent_and_image:
+
+        call: googleapis.cloudbuild.v1.projects.builds.create
+
+        args:
+
+          projectId: ${project_id}
+
+          parent: ${"projects/" + project_id + "/locations/global"}
+
+          body:
+
+            steps:
+
+              - name: "gcr.io/cloud-builders/gcloud"
+
+                entrypoint: "bash"
+
+                args:
+
+                  - -c
+
+                  - |
+
+                    set -e
+
+                    INSTANCE_NAME="${_INSTANCE_NAME}"
+
+                    SOURCE_IMAGE_ID="${_SOURCE_IMAGE_ID}"
+
+                    NEW_IMAGE_NAME="$${SOURCE_IMAGE_ID}-no-agent"
+
+                    echo "Step 1: Removing Qualys agent from VM $${INSTANCE_NAME}..."
+
+                    # Stop Qualys agent service
+
+                    gcloud compute ssh "$${INSTANCE_NAME}" \
+
+                      --zone=${_ZONE} \
+
+                      --project=${_PROJECT_ID} \
+
+                      --command="sudo systemctl stop qualys-cloud-agent 2>&1 || echo 'Service may not be running'" 2>&1
+
+                    # Disable Qualys agent service
+
+                    gcloud compute ssh "$${INSTANCE_NAME}" \
+
+                      --zone=${_ZONE} \
+
+                      --project=${_PROJECT_ID} \
+
+                      --command="sudo systemctl disable qualys-cloud-agent 2>&1 || echo 'Service may not exist'" 2>&1
+
+                    # Remove Qualys agent files and directories
+
+                    gcloud compute ssh "$${INSTANCE_NAME}" \
+
+                      --zone=${_ZONE} \
+
+                      --project=${_PROJECT_ID} \
+
+                      --command="sudo rm -rf /opt/qualys /var/log/qualys /etc/systemd/system/qualys-cloud-agent.service 2>&1 || echo 'Some files may not exist'" 2>&1
+
+                    # Reload systemd daemon
+
+                    gcloud compute ssh "$${INSTANCE_NAME}" \
+
+                      --zone=${_ZONE} \
+
+                      --project=${_PROJECT_ID} \
+
+                      --command="sudo systemctl daemon-reload 2>&1" 2>&1
+
+                    echo "Qualys agent removed successfully"
+
+                    echo "Step 2: Stopping VM before creating image..."
+
+                    # Stop the VM
+
+                    gcloud compute instances stop "$${INSTANCE_NAME}" \
+
+                      --zone=${_ZONE} \
+
+                      --project=${_PROJECT_ID} \
+
+                      --quiet
+
+                    echo "VM stopped. Waiting for disk to be ready..."
+
+                    sleep 15
+
+                    echo "Step 3: Creating new image from VM (without Qualys agent)..."
+
+                    # Create new image from VM disk
+
+                    gcloud compute images create "$${NEW_IMAGE_NAME}" \
+
+                      --source-disk="$${INSTANCE_NAME}" \
+
+                      --source-disk-zone=${_ZONE} \
+
+                      --project=${_PROJECT_ID} \
+
+                      --description="RHEL9 image validated and cleaned (Qualys agent removed)" \
+
+                      --family="rhel9-runtime" \
+
+                      --labels=source_image="$${SOURCE_IMAGE_ID}",qualys_agent="removed",validation_status="passed"
+
+                    echo "Waiting for image to be ready..."
+
+                    # Wait for image to be ready
+
+                    while true; do
+
+                      STATUS=$$(gcloud compute images describe "$${NEW_IMAGE_NAME}" --project=${_PROJECT_ID} --format="get(status)" 2>/dev/null || echo "NOT_FOUND")
+
+                      if [ "$${STATUS}" == "READY" ]; then
+
+                        break
+
+                      elif [ "$${STATUS}" == "FAILED" ]; then
+
+                        echo "ERROR: Image creation failed"
+
+                        exit 1
+
+                      fi
+
+                      echo "   Image status: $${STATUS} (waiting...)"
+
+                      sleep 10
+
+                    done
+
+                    echo "New image created successfully: $${NEW_IMAGE_NAME}"
+
+                    echo "{\"new_image_id\":\"$${NEW_IMAGE_NAME}\",\"source_image_id\":\"$${SOURCE_IMAGE_ID}\"}" > "$$BUILDER_OUTPUT/output"
+
+            substitutions:
+
+              _INSTANCE_NAME: ${instance_name}
+
+              _PROJECT_ID: ${project_id}
+
+              _ZONE: ${zone}
+
+              _SOURCE_IMAGE_ID: ${source_image_id}
+
+            options:
+
+              dynamic_substitutions: true
+
+            tags:
+
+              - "remove-agent"
+
+              - "create-image"
+
+        result: build_result
+
+ 
+
+    - decode_result:
+
+        assign:
+
+          - result_json: ${text.decode(base64.decode(build_result.metadata.build.results.buildStepOutputs[0]))}
+
+          - result: ${json.decode(result_json)}
+
+          - new_image_id: ${result.new_image_id}
+
+ 
+
+    - return_new_image_result:
+
+        return:
+
+          new_image_id: ${new_image_id}
+
+ 
+
+# -------------------------------------------------------------------
+
+#   PROMOTE IMAGE: Copy image to display project with ephemeral label
+
+# -------------------------------------------------------------------
+
+ 
+
+promote_image:
+
+  params: [image_id, project_id, display_project_id]
+
+ 
+
+  steps:
+
+    - promote:
+
+        call: googleapis.cloudbuild.v1.projects.builds.create
+
+        args:
+
+          projectId: ${project_id}
+
+          parent: ${"projects/" + project_id + "/locations/global"}
+
+          body:
+
+            steps:
+
+              - name: "gcr.io/cloud-builders/gcloud"
+
+                entrypoint: "bash"
+
+                args:
+
+                  - -c
+
+                  - |
+
+                    set -e
+
+                    SOURCE_IMAGE="${_IMAGE_ID}"
+
+                    SOURCE_PROJECT="${_SOURCE_PROJECT_ID}"
+
+                    DISPLAY_PROJECT="${_DISPLAY_PROJECT_ID}"
+
+                    echo "Promoting image $${SOURCE_IMAGE} from $${SOURCE_PROJECT} to $${DISPLAY_PROJECT}..."
+
+                    # Copy image to display project with ephemeral label
+
+                    PROMOTED_DATE=$$(date +%Y%m%d)
+
+                    gcloud compute images create "$${SOURCE_IMAGE}" \
+
+                      --source-image="projects/$${SOURCE_PROJECT}/global/images/$${SOURCE_IMAGE}" \
+
+                      --project=$${DISPLAY_PROJECT} \
+
+                      --description="Promoted validated image from $${SOURCE_PROJECT} (Qualys agent removed)" \
+
+                      --family="rhel9-runtime" \
+
+                      --labels=source_image="$${SOURCE_IMAGE}",source_project="$${SOURCE_PROJECT}",validation_status="passed",promoted_date="$${PROMOTED_DATE}",ephemeral="true"
+
+                    echo "Waiting for image to be ready..."
+
+                    # Wait for image to be ready
+
+                    while true; do
+
+                      STATUS=$$(gcloud compute images describe "$${SOURCE_IMAGE}" --project=$${DISPLAY_PROJECT} --format="get(status)" 2>/dev/null || echo "NOT_FOUND")
+
+                      if [ "$${STATUS}" == "READY" ]; then
+
+                        break
+
+                      fi
+
+                      sleep 10
+
+                    done
+
+                    echo "Image successfully promoted to $${DISPLAY_PROJECT} with ephemeral label!"
+
+                    echo "{\"promoted_image\":\"$${SOURCE_IMAGE}\",\"display_project\":\"$${DISPLAY_PROJECT}\",\"ephemeral\":\"true\"}" > "$$BUILDER_OUTPUT/output"
+
+            substitutions:
+
+              _IMAGE_ID: ${image_id}
+
+              _SOURCE_PROJECT_ID: ${project_id}
+
+              _DISPLAY_PROJECT_ID: ${display_project_id}
+
+            options:
+
+              dynamic_substitutions: true
+
+            tags:
+
+              - "promotion"
+
+              - "ephemeral"
+
+        result: promote_result
+
+ 
+
+    - return_promote_result:
+
+        return: ${"Image promoted successfully with ephemeral label"}
+
+ 
+
+# -------------------------------------------------------------------
+
+#   CLEANUP: Delete validation VM
+
+# -------------------------------------------------------------------
+
+ 
+
+cleanup_vm:
+
+  params: [instance_name, project_id, zone]
+
+ 
+
+  steps:
+
+    - delete_vm:
+
+        call: googleapis.cloudbuild.v1.projects.builds.create
+
+        args:
+
+          projectId: ${project_id}
+
+          parent: ${"projects/" + project_id + "/locations/global"}
+
+          body:
+
+            steps:
+
+              - name: "gcr.io/cloud-builders/gcloud"
+
+                entrypoint: "bash"
+
+                args:
+
+                  - -c
+
+                  - |
+
+                    set -e
+
+                    INSTANCE_NAME="${_INSTANCE_NAME}"
+
+                    echo "Stopping VM $${INSTANCE_NAME}..."
+
+                    gcloud compute instances stop "$${INSTANCE_NAME}" --zone=${_ZONE} --project=${_PROJECT_ID} --quiet || echo "VM may already be stopped"
+
+                    sleep 10
+
+                    echo "Deleting VM $${INSTANCE_NAME}..."
+
+                    gcloud compute instances delete "$${INSTANCE_NAME}" --zone=${_ZONE} --project=${_PROJECT_ID} --quiet
+
+                    echo "VM deleted successfully"
+
+                    echo "{\"instance_deleted\":\"$${INSTANCE_NAME}\"}" > "$$BUILDER_OUTPUT/output"
+
+            substitutions:
+
+              _INSTANCE_NAME: ${instance_name}
+
+              _PROJECT_ID: ${project_id}
+
+              _ZONE: ${zone}
+
+            options:
+
+              dynamic_substitutions: true
+
+            tags:
+
+              - "cleanup"
+
+        result: cleanup_result
+
+ 
+
+    - return_cleanup_result:
+
+        return: ${"VM cleanup completed"}
+
